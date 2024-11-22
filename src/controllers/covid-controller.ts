@@ -188,30 +188,25 @@ export const getRegionsAggregatedData = async (req: Request, res: Response) => {
 
 export const getAverageVaccinatedData = async (req: Request, res: Response) => {
     try {
-        const cacheKey = `vaccination-coverage`;
+        const cacheKey = `vaccination-coverage-23`;
 
         const readMongo = async () => {
             const aggregationPipeline: PipelineStage[] = [
                 {
                     $group: {
-                        _id: '$iso_code',
+                        _id: '$iso_code', // Group by ISO code
                         average_vaccinated: {
                             $avg: {
-                                $toDouble: {
-                                    $ifNull: [
-                                        '$people_vaccinated_per_hundred',
-                                        0,
-                                    ],
-                                },
+                                $toDouble: '$people_vaccinated_per_hundred',
                             },
                         },
                     },
                 },
                 {
                     $project: {
-                        _id: 0,
-                        id: '$_id',
-                        value: { $round: ['$average_vaccinated', 2] },
+                        _id: 0, // Exclude MongoDB's default `_id`
+                        id: '$_id', // ISO code as `id`
+                        value: { $round: ['$average_vaccinated', 2] }, // Round to 2 decimal places
                     },
                 },
             ];
