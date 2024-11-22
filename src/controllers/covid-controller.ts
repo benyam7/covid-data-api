@@ -3,25 +3,46 @@ import { z } from 'zod';
 import { CovidData, ICovidData } from '../models/covid-data';
 import redisClient from '../utils/redis-client';
 import { PipelineStage } from 'mongoose';
+import logger from '../utils/logger';
 
-const querySchema = z.object({
-    startDate: z.string().refine((date) => !isNaN(Date.parse(date)), {
-        message: 'Invalid startDate',
-    }),
-    endDate: z.string().refine((date) => !isNaN(Date.parse(date)), {
-        message: 'Invalid endDate',
-    }),
-    country: z.array(z.string()),
-    query_type: z.string(),
-    page: z
-        .string()
-        .optional()
-        .transform((val) => parseInt(val || '1')),
-    limit: z
-        .string()
-        .optional()
-        .transform((val) => parseInt(val || '10')),
-});
+const querySchema = z
+    .object({
+        startDate: z.string().refine((date) => !isNaN(Date.parse(date)), {
+            message: 'Invalid startDate',
+        }),
+        endDate: z.string().refine((date) => !isNaN(Date.parse(date)), {
+            message: 'Invalid endDate',
+        }),
+        country: z.array(z.string()),
+        query_type: z.string(),
+        page: z
+            .string()
+            .optional()
+            .transform((val) => parseInt(val || '1')),
+        limit: z
+            .string()
+            .optional()
+            .transform((val) => parseInt(val || '10')),
+    })
+    .refine((data) => new Date(data.startDate) <= new Date(data.endDate), {
+        message: 'startDate must be before or equal to endDate',
+        path: ['startDate', 'endDate'],
+    });
+
+// Utility function for caching with data compression
+async function getCachedData<T>(
+    cacheKey: string,
+    readMongo: () => Promise<T>
+): Promise<T> {
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+        logger.info(`Data retrieved from cache for key: ${cacheKey}`);
+        return JSON.parse(cachedData.toString());
+    }
+    const data = await readMongo();
+    await redisClient.setEx(cacheKey, 3600 * 24 * 7, JSON.stringify(data));
+    return data;
+}
 
 export const getComparisonData = async (req: Request, res: Response) => {
     try {
@@ -44,176 +65,171 @@ export const getComparisonData = async (req: Request, res: Response) => {
             ','
         )}:${query_type}:page:${page}:limit:${limit}`;
 
-        // Check if data exists in cache
-        const cachedData = await redisClient.get(cacheKey);
+        const readMongo = async () => {
+            // Build MongoDB query
+            const mongoQuery = {
+                location: { $in: country },
+                date: {
+                    $gte: new Date(startDate),
+                    $lte: new Date(endDate),
+                },
+            };
 
-        if (cachedData) {
-            // Data found in cache, return it
-            console.log('Data found in cache', JSON.parse(cachedData));
-            res.json(JSON.parse(cachedData));
-            return;
-        }
-        console.log('going to mongo');
+            // Pagination
+            const skip = (page - 1) * limit;
 
-        // Build MongoDB query
-        const mongoQuery = {
-            location: { $in: country },
-            date: {
-                $gte: new Date(startDate),
-                $lte: new Date(endDate),
-            },
+            // Build aggregation pipeline
+            const aggregationPipeline: PipelineStage[] = [
+                { $match: mongoQuery },
+                {
+                    $project: {
+                        date: {
+                            $dateToString: {
+                                format: '%Y-%m-%d',
+                                date: '$date',
+                            },
+                        },
+                        location: { $toLower: '$location' },
+                        value: { $ifNull: [`$${query_type}`, 0] },
+                    },
+                },
+                {
+                    $group: {
+                        _id: '$date',
+                        data: {
+                            $push: {
+                                k: '$location',
+                                v: { $toDouble: '$value' },
+                            },
+                        },
+                    },
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        date: '$_id',
+                        data: { $arrayToObject: '$data' },
+                    },
+                },
+                { $sort: { date: 1 } },
+                // { $skip: skip },
+                { $limit: limit },
+            ];
+
+            // Fetch data from MongoDB
+            const data = await CovidData.aggregate(aggregationPipeline).exec();
+
+            // Transform data into desired format
+            const response = data.map((item) => {
+                return { date: item.date, ...item.data };
+            });
+
+            return response;
         };
 
-        // Projection
-        const projection = {
-            date: 1,
-            location: 1,
-            [query_type]: 1,
-            _id: 0,
-        };
-
-        // Pagination
-        const skip = (page - 1) * limit;
-
-        // Fetch data
-        const data: ICovidData[] = await CovidData.find(mongoQuery, projection)
-            .sort({ date: 1 })
-            // .skip(skip)
-            .limit(limit)
-            .lean();
-
-        console.log('data from mongo', data);
-        // Transform data
-        const response = data.reduce((acc: any[], curr) => {
-            const dateStr = curr.date.toISOString().split('T')[0];
-            let dateEntry = acc.find((entry) => entry.date === dateStr);
-
-            if (!dateEntry) {
-                dateEntry = { date: dateStr };
-                acc.push(dateEntry);
-            }
-
-            dateEntry[curr.location.toLowerCase()] =
-                curr[query_type as keyof ICovidData] || 0;
-
-            return acc;
-        }, []);
-        console.log('response after transformation', response);
-        // Store the result in Redis cache with an expiration time
-        await redisClient.setEx(
-            cacheKey,
-            3600 * 24 * 7,
-            JSON.stringify(response)
-        ); // Cache for 1 week ( we could cache it forever as the data is not changing, but since i am on free plan I am limited by cache size)
-
-        res.json(response);
+        const response = await getCachedData(cacheKey, readMongo);
+        res.status(200).json(response);
     } catch (error) {
         if (error instanceof z.ZodError) {
-            res.status(400).json({ errors: error.errors });
+            res.status(400).json({ success: false, errors: error.errors });
         } else {
-            console.error(error);
-            res.status(500).json({ error: 'Internal Server Error' });
+            logger.error('Error in getComparisonData:', error);
+            res.status(500).json({
+                success: false,
+                error: 'Internal Server Error',
+            });
         }
     }
 };
+
 export const getRegionsAggregatedData = async (req: Request, res: Response) => {
     try {
-        // Create a unique cache key
-        const cacheKey = `regions-aggregates-essentials`;
+        const cacheKey = `regions-aggregates-essentials-093`;
 
-        // Check if data exists in cache
-        const cachedData = await redisClient.get(cacheKey);
-        if (cachedData) {
-            // Data found in cache, return it
-            console.log(
-                'Region aggregates from cache:',
-                JSON.parse(cachedData)
-            );
-            res.json(JSON.parse(cachedData));
-            return;
-        }
-
-        const aggregationPipeline: PipelineStage[] = [
-            {
-                $group: {
-                    _id: '$continent',
-                    total_cases: { $sum: { $toDouble: '$total_cases' } },
-                    total_deaths: { $sum: { $toDouble: '$total_deaths' } },
-                    female_smokers: {
-                        $avg: { $toDouble: '$female_smokers' },
+        const readMongo = async () => {
+            const aggregationPipeline: PipelineStage[] = [
+                {
+                    $group: {
+                        _id: '$continent',
+                        total_cases: { $sum: { $toDouble: '$total_cases' } },
+                        total_deaths: { $sum: { $toDouble: '$total_deaths' } },
+                        female_smokers: {
+                            $avg: { $toDouble: '$female_smokers' },
+                        },
+                        male_smokers: { $avg: { $toDouble: '$male_smokers' } },
+                        aged_65_older: { $avg: '$aged_65_older' },
+                        aged_70_older: { $avg: '$aged_70_older' },
                     },
-                    male_smokers: { $avg: { $toDouble: '$male_smokers' } },
-                    aged_65_older: { $avg: '$aged_65_older' },
-                    aged_70_older: { $avg: '$aged_70_older' },
                 },
-            },
-        ];
-        // Execute the aggregation pipeline
-        const continentsData = await CovidData.aggregate(aggregationPipeline, {
-            allowDiskUse: true,
-        }).exec();
+            ];
 
-        // Cache the results
-        await redisClient.setEx(
-            cacheKey,
-            3600 * 24 * 7,
-            JSON.stringify(continentsData)
-        ); // Cache for 1 week
+            // Execute the aggregation pipeline
+            const continentsData = await CovidData.aggregate(
+                aggregationPipeline,
+                {
+                    allowDiskUse: true,
+                }
+            ).exec();
 
-        // Return the aggregated data
-        res.json(continentsData);
+            return continentsData;
+        };
+
+        const continentsData = await getCachedData(cacheKey, readMongo);
+
+        res.status(200).json(continentsData);
     } catch (error) {
-        console.error('Error fetching continents data:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        logger.error('Error fetching continents data:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal Server Error',
+        });
     }
 };
 
 export const getAverageVaccinatedData = async (req: Request, res: Response) => {
     try {
-        // Create a unique cache key
         const cacheKey = `vaccination-coverage`;
 
-        // Check if data exists in cache
-        const cachedData = await redisClient.get(cacheKey);
-        if (cachedData) {
-            // Data found in cache, return it
-            console.log(
-                'Region aggregates from cache:',
-                JSON.parse(cachedData)
-            );
-            res.json(JSON.parse(cachedData));
-            return;
-        }
-
-        const aggregationPipeline: PipelineStage[] = [
-            {
-                $group: {
-                    _id: '$iso_code', // Group by ISO code
-                    average_vaccinated: {
-                        $avg: { $toDouble: '$people_vaccinated_per_hundred' },
+        const readMongo = async () => {
+            const aggregationPipeline: PipelineStage[] = [
+                {
+                    $group: {
+                        _id: '$iso_code',
+                        average_vaccinated: {
+                            $avg: {
+                                $toDouble: {
+                                    $ifNull: [
+                                        '$people_vaccinated_per_hundred',
+                                        0,
+                                    ],
+                                },
+                            },
+                        },
                     },
                 },
-            },
-            {
-                $project: {
-                    _id: 0, // Exclude MongoDB's default `_id`
-                    id: '$_id', // ISO code as `id`
-                    value: { $round: ['$average_vaccinated', 2] }, // Round to 2 decimal places
+                {
+                    $project: {
+                        _id: 0,
+                        id: '$_id',
+                        value: { $round: ['$average_vaccinated', 2] },
+                    },
                 },
-            },
-        ];
+            ];
 
-        const result = await CovidData.aggregate(aggregationPipeline).exec();
-        // Cache the results
-        await redisClient.setEx(
-            cacheKey,
-            3600 * 24 * 7,
-            JSON.stringify(result)
-        ); // Cache for 1 week
+            const result = await CovidData.aggregate(
+                aggregationPipeline
+            ).exec();
+            return result;
+        };
 
-        res.json(result);
+        const result = await getCachedData(cacheKey, readMongo);
+
+        res.status(200).json(result);
     } catch (error) {
-        console.error('Error fetching average vaccination data:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        logger.error('Error fetching average vaccination data:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal Server Error',
+        });
     }
 };
