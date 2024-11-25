@@ -110,6 +110,12 @@ To improve performance and reduce database load, the API employs a robust cachin
 
 ---
 
+## Database Choice: MongoDB over SQL
+
+While SQL databases are often better optimized for data analysis and visualization due to their powerful querying capabilities and structured data schema, in this case, we opted to use MongoDB. The primary reason for this decision was the presence of invalid or inconsistent data in the CSV files we were working with. Cleaning large CSV files to fit the rigid schema requirements of SQL databases can be challenging and time-consuming.
+
+MongoDB, being a NoSQL database, offers a flexible schema-less design, which makes it more accommodating for datasets with irregularities or missing fields. This flexibility allowed us to ingest and work with the data more efficiently without the need for extensive preprocessing or data cleansing that a SQL database would require. As a result, we could focus on building the data visualization components without being hindered by data import issues.
+
 ## Technologies Used
 
 -   **Backend**:
